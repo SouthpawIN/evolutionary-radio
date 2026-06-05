@@ -77,6 +77,15 @@ def _remove_pid() -> None:
 # ---------------------------------------------------------------------------
 # Loop 1: Playback (consumer)
 # ---------------------------------------------------------------------------
+async def _poll_skip_file(skip_path: Path, queue: RadioQueue) -> None:
+    """Periodically check for skip request file during playback."""
+    while True:
+        await asyncio.sleep(1.0)
+        if skip_path.exists():
+            skip_path.unlink(missing_ok=True)
+            queue.request_skip()
+            return
+
 async def playback_loop(
     queue: RadioQueue,
     player: MpvPlayer,
@@ -95,16 +104,46 @@ async def playback_loop(
         skipped = False
 
         try:
+            # Clear the end-file event BEFORE loading to prevent stale
+            # events from the previous track causing immediate return.
+            player._end_file_event.clear()
             await player.loadfile(track.audio_path)
 
+            # Wait a moment for mpv to actually start playing the file.
+            # Without this, a stale end-file event can fire immediately.
+            await asyncio.sleep(1.0)
+
+            # If end-file already fired during loadfile (race condition),
+            # it means mpv rejected or immediately finished the file.
+            # Log it and try the next track instead of hanging.
+            if player._end_file_event.is_set():
+                log.warning("end-file fired immediately after loadfile — file may be invalid: %s", track.audio_path)
+                player._end_file_event.clear()
+                # Don't wait — just move to next track
+                continue
+
+            # Check for skip request file (written by CLI cmd_skip)
+            skip_req = _state_dir() / "skip_request"
+            if skip_req.exists():
+                skip_req.unlink(missing_ok=True)
+                queue.request_skip()
+
             # Wait for either: track ends, or skip is requested
+            # Poll for skip file every 1s while waiting for track to end
             done_task = asyncio.create_task(player.wait_for_end())
             skip_task = asyncio.create_task(queue.wait_for_skip())
+            skip_poll = asyncio.create_task(_poll_skip_file(skip_req, queue))
 
             finished, pending = await asyncio.wait(
-                [done_task, skip_task],
+                [done_task, skip_task, skip_poll],
                 return_when=asyncio.FIRST_COMPLETED,
             )
+
+            # Log which task completed
+            if done_task in finished:
+                log.info("track ended naturally")
+            if skip_task in finished:
+                log.info("skip requested")
 
             # Cancel whichever didn't fire
             for t in pending:

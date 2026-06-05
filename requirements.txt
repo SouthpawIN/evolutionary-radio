@@ -1,0 +1,17 @@
+# Evolutionary Radio - Python Dependencies
+# Install: pip install -r requirements.txt
+
+# Audio generation
+torch>=2.0.0
+torchcodec>=0.14.0
+soundfile>=0.12.0
+
+# Configuration
+pyyaml>=6.0
+
+# ACE-Step music generation model
+# This installs the ace_step package (import as: acestep)
+ace_step @ git+https://github.com/ace-step/ACE-Step.git
+
+# Audio playback (system dependency, not pip)
+# Install mpv: brew install mpv (macOS) or apt install mpv (Linux)
