@@ -36,6 +36,9 @@ from prompt_template import PromptTemplate
 from omni_client import OmniClient
 from acestep_client import AceStepClient
 from skip_logger import SkipLogger
+from feedback import FeedbackLogger, FeedbackRecord
+from gepa import GEPAPool
+from darwin import DarwinPopulation
 
 # ---------------------------------------------------------------------------
 # Config
@@ -91,6 +94,7 @@ async def playback_loop(
     player: MpvPlayer,
     skip_logger: SkipLogger,
     cfg: dict,
+    feedback_logger: FeedbackLogger = None,
 ) -> None:
     """Dequeue a track, play it via mpv, log the result."""
     log = logging.getLogger("radio.playback")
@@ -182,6 +186,27 @@ async def playback_loop(
         # Update state file
         _write_state(queue.status())
 
+        # Poll for feedback requests (like/dislike) written by CLI
+        feedback_req = _state_dir() / "feedback_request"
+        if feedback_req.exists():
+            try:
+                sentiment = feedback_req.read_text().strip()
+                feedback_req.unlink(missing_ok=True)
+                if sentiment in ("like", "dislike") and feedback_logger:
+                    record = FeedbackRecord(
+                        track_id=getattr(track, "meta", {}).get("track_id", ""),
+                        sentiment=sentiment,
+                        tags=track.tags,
+                        played_seconds=played,
+                        total_seconds=track.duration_sec,
+                        vibe=getattr(queue_fill_loop, "_vibe", ""),
+                        genome_id=getattr(track, "meta", {}).get("genome_id", ""),
+                    )
+                    feedback_logger.log(record)
+                    log.info("feedback: %s for track %s", sentiment, record.track_id)
+            except (OSError, ValueError) as e:
+                log.warning("failed to read feedback request: %s", e)
+
 # ---------------------------------------------------------------------------
 # Loop 2: Queue Fill (producer)
 # ---------------------------------------------------------------------------
@@ -191,6 +216,9 @@ async def queue_fill_loop(
     voice: AceStepClient,
     prompt_cfg: dict,
     queue_cfg: dict,
+    gepa_pool: GEPAPool = None,
+    darwin_pop: DarwinPopulation = None,
+    feedback_logger: FeedbackLogger = None,
 ) -> None:
     """If queue is below target, generate a new track."""
     log = logging.getLogger("radio.queue_fill")
@@ -203,6 +231,7 @@ async def queue_fill_loop(
 
     # Default vibe if none set
     vibe = getattr(queue_fill_loop, "_vibe", "chill lofi beats for coding")
+    current_genome_id = "default"
 
     while True:
         try:
@@ -212,7 +241,14 @@ async def queue_fill_loop(
                 # Step 1: Get tags from OmniStep
                 t0 = time.time()
                 try:
-                    tags = omni.generate_tags(vibe, system_prompt)
+                    # Use GEPA genome to bias the prompt if available
+                    effective_prompt = system_prompt
+                    if gepa_pool and gepa_pool.genomes:
+                        genome = gepa_pool.select_genome()
+                        current_genome_id = genome.genome_id
+                        effective_prompt = gepa_pool.build_system_prompt(genome, system_prompt)
+                        log.info("using GEPA genome: %s (fitness=%.3f)", genome.genome_id, genome.fitness)
+                    tags = omni.generate_tags(vibe, effective_prompt)
                     log.info("OmniStep tags: %s (%.1fs)", tags, time.time() - t0)
                 except Exception as e:
                     log.warning("OmniStep failed, using seed fallback: %s", e)
@@ -235,7 +271,7 @@ async def queue_fill_loop(
                     generated_at=time.time(),
                     duration_sec=duration,
                     source="omnistep",
-                    meta={"gen_latency_sec": gen_time},
+                    meta={"gen_latency_sec": gen_time, "genome_id": current_genome_id},
                 )
 
                 ok = await queue.put_track(track)
@@ -279,6 +315,11 @@ async def run_radio(vibe: str, cfg: dict) -> None:
 
     skip_logger = SkipLogger(path=cfg.get("skip_log", os.path.expanduser("~/path/to/skip_log.jsonl")))
 
+    # Feedback + evolution systems
+    feedback_logger = FeedbackLogger()
+    gepa_pool = GEPAPool(feedback_logger)
+    darwin_pop = DarwinPopulation(feedback_logger)
+
     # Write PID file
     _write_pid()
 
@@ -310,13 +351,31 @@ async def run_radio(vibe: str, cfg: dict) -> None:
 
     # Start both loops
     playback_task = asyncio.create_task(
-        playback_loop(queue, player, skip_logger, cfg),
+        playback_loop(queue, player, skip_logger, cfg, feedback_logger=feedback_logger),
         name="playback",
     )
     fill_task = asyncio.create_task(
-        queue_fill_loop(queue, omni, voice, cfg["brain"], cfg["queue"]),
+        queue_fill_loop(queue, omni, voice, cfg["brain"], cfg["queue"],
+                        gepa_pool=gepa_pool, darwin_pop=darwin_pop, feedback_logger=feedback_logger),
         name="queue_fill",
     )
+
+    # Loop 3: Evolution (GEPA + Darwin) — runs every 10 minutes
+    async def evolution_loop():
+        evo_log = logging.getLogger("radio.evolution")
+        evo_interval = cfg.get("evolution", {}).get("interval_sec", 600)
+        while True:
+            await asyncio.sleep(evo_interval)
+            try:
+                evo_log.info("running GEPA evolution...")
+                gepa_pool.evolve()
+                evo_log.info("running Darwin evolution...")
+                darwin_pop.evolve_generation()
+                evo_log.info("evolution complete")
+            except Exception as e:
+                evo_log.error("evolution error: %s", e)
+
+    evo_task = asyncio.create_task(evolution_loop(), name="evolution")
 
     log.info("radio started — vibe: %s", vibe)
     print(f"🎶 Radio started — vibe: {vibe}")
@@ -332,8 +391,9 @@ async def run_radio(vibe: str, cfg: dict) -> None:
     log.info("shutting down...")
     playback_task.cancel()
     fill_task.cancel()
+    evo_task.cancel()
 
-    for task in [playback_task, fill_task]:
+    for task in [playback_task, fill_task, evo_task]:
         try:
             await task
         except asyncio.CancelledError:
@@ -375,6 +435,76 @@ def cmd_skip(_args):
     skip_req.touch()
     print("Skip requested")
 
+def cmd_skip_next(args):
+    """Skip the next N tracks in the queue."""
+    state = _state_file()
+    if not state.exists():
+        print("No running radio found")
+        return
+    n = getattr(args, "count", 1) or 1
+    # Write skip_next request with count
+    skip_req = _state_dir() / "skip_next_request"
+    with open(skip_req, "w") as f:
+        f.write(str(n))
+    print(f"Skip next {n} track(s) requested")
+
+def cmd_like(_args):
+    """Like the currently playing track."""
+    state = _state_file()
+    if not state.exists():
+        print("No running radio found")
+        return
+    feedback_req = _state_dir() / "feedback_request"
+    with open(feedback_req, "w") as f:
+        f.write("like")
+    print("👍 Liked!")
+
+def cmd_dislike(_args):
+    """Dislike the currently playing track."""
+    state = _state_file()
+    if not state.exists():
+        print("No running radio found")
+        return
+    feedback_req = _state_dir() / "feedback_request"
+    with open(feedback_req, "w") as f:
+        f.write("dislike")
+    print("👎 Disliked")
+
+def cmd_queue(_args):
+    """Show what's in the queue."""
+    state = _state_file()
+    if not state.exists():
+        print("No running radio found")
+        return
+    with open(state) as f:
+        status = json.load(f)
+    history = status.get("history", [])
+    depth = status.get("depth", 0)
+    maxsize = status.get("maxsize", 5)
+    print(f"Queue: {depth}/{maxsize}")
+    if history:
+        print("\nRecent tracks:")
+        for i, t in enumerate(history[-5:]):
+            tags = t.get("tags", "?")[:60]
+            skipped = " ⏭" if t.get("skipped") else ""
+            print(f"  {i+1}. {tags}{skipped}")
+    else:
+        print("  (empty)")
+
+def cmd_evolve(_args):
+    """Trigger an immediate evolution step."""
+    feedback = FeedbackLogger()
+    gepa_pool = GEPAPool(feedback)
+    darwin_pop = DarwinPopulation(feedback)
+    print("Running GEPA evolution...")
+    gepa_pool.evolve()
+    print("Running Darwin evolution...")
+    darwin_pop.evolve_generation()
+    best_gepa = gepa_pool.genomes[0] if gepa_pool.genomes else None
+    best_darwin = darwin_pop.get_best()
+    print(f"\nBest GEPA genome: {best_gepa.genome_id} (fitness={best_gepa.fitness:.3f})" if best_gepa else "No GEPA genomes")
+    print(f"Best Darwin genome: {best_darwin.genome_id} (fitness={best_darwin.fitness:.3f})")
+
 def cmd_status(_args):
     state = _state_file()
     if not state.exists():
@@ -393,6 +523,12 @@ def main():
 
     sub.add_parser("stop", help="Stop the radio")
     sub.add_parser("skip", help="Skip current track")
+    skip_next_p = sub.add_parser("skip-next", help="Skip next N tracks in queue")
+    skip_next_p.add_argument("count", type=int, nargs="?", default=1, help="Number of tracks to skip")
+    sub.add_parser("like", help="Like the current track")
+    sub.add_parser("dislike", help="Dislike the current track")
+    sub.add_parser("queue", help="Show queue contents")
+    sub.add_parser("evolve", help="Trigger immediate evolution")
     sub.add_parser("status", help="Show radio status")
 
     args = parser.parse_args()
@@ -403,6 +539,16 @@ def main():
         cmd_stop(args)
     elif args.command == "skip":
         cmd_skip(args)
+    elif args.command == "skip-next":
+        cmd_skip_next(args)
+    elif args.command == "like":
+        cmd_like(args)
+    elif args.command == "dislike":
+        cmd_dislike(args)
+    elif args.command == "queue":
+        cmd_queue(args)
+    elif args.command == "evolve":
+        cmd_evolve(args)
     elif args.command == "status":
         cmd_status(args)
     else:

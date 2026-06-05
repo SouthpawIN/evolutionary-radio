@@ -47,19 +47,19 @@ player:
     - "--idle=yes"
 
 gepa:
-  # Loop 3: GEPA prompt evolution — STUB in v0.2.0
-  # Cadence in seconds (60 = every minute in the stub; real cadence is per-skill spec)
-  cadence_sec: 60
+  # GEPA: Gradient-Free Prompt Evolution
   population_size: 8
-  # Minimum generations before GEPA is allowed to run
-  min_gens_before_evolve: 5
+  mutation_rate: 0.3
+  tournament_size: 3
 
 darwin:
-  # Loop 4: Darwin weight evolution — STUB in v0.2.0
-  # How often to "tick" in the stub (hours)
-  cadence_hours: 24
-  # For testing: if true, tick every 60s instead of every cadence_hours
-  fast_stub: false
+  # Darwin Family: Genome evolution via MRI-Trust Fusion
+  population_size: 8
+  tournament_size: 3
+
+evolution:
+  # How often to run GEPA + Darwin evolution (seconds)
+  interval_sec: 600
 
 state:
   # Where the running radio writes its current state (queue depth, last tracks, etc.)
@@ -73,4 +73,4 @@ log:
   file: ~/path/to/radio.log
   level: INFO
 
-skip_log: ~/path/to/skip_log.jsonl
+skip_log: ~/.local/share/evolutionary-radio/skip_log.jsonl
