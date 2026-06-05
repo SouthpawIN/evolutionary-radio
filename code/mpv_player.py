@@ -1,28 +1,11 @@
 """
 mpv_player.py — mpv IPC control via a Unix domain socket.
 
-This module is part of **Loop 1 (playback)**. It spawns mpv with
-``--input-ipc-server=/tmp/hermes-mpv-<uuid>`` and exchanges JSON commands
-with it over a Python ``socket`` connection. We deliberately do **not**
-use socat — Python's socket module is enough, and avoids the extra
-dependency.
+Single-reader architecture: one background task reads ALL messages from
+the mpv socket and routes them to either command responses or event handlers.
 
-The public API is async-friendly: the underlying socket I/O is run in a
-thread executor so the asyncio event loop is never blocked on a slow
-``recv()``.
-
-Commands supported:
-  * ``loadfile(path)``  — start playback of a new file
-  * ``pause()`` / ``resume()``
-  * ``set_volume(0-130)``  — mpv's volume range is 0-130, not 0-100
-  * ``quit()``
-
-We also expose a *passive* event watcher (``watch_events``) that yields
-mpv's unsolicited events — the one we care about is ``end-file``, which
-signals the consumer loop to dequeue the next track.
-
-Pitfall (from the master skill): the Unix socket file is **not** cleaned
-up by mpv on exit. We must ``os.unlink`` it in ``stop()``.
+This eliminates the race condition where two readers compete for socket
+data and events get consumed by the wrong reader.
 """
 from __future__ import annotations
 
@@ -34,7 +17,7 @@ import socket
 import subprocess
 import uuid
 from pathlib import Path
-from typing import Any, AsyncIterator, Optional
+from typing import Any, Optional
 
 log = logging.getLogger("radio.mpv")
 
@@ -65,16 +48,13 @@ class MpvPlayer:
         self._sock: Optional[socket.socket] = None
         self._connected = asyncio.Event()
         self._end_file_event = asyncio.Event()
-        # Lock around socket writes — mpv IPC is line-based JSON.
-        self._write_lock = asyncio.Lock()
+        # Pending command responses: request_id -> Future
+        self._pending_responses: dict[int, asyncio.Future] = {}
+        self._request_counter = 0
 
     # ----------------------------------------------------------- lifecycle
     def start(self) -> None:
-        """Spawn the mpv subprocess. Does not block.
-
-        After calling ``start()``, call ``connect()`` to attach the IPC socket
-        and then ``wait_ready()`` to make sure mpv is listening.
-        """
+        """Spawn the mpv subprocess. Does not block."""
         if self._proc is not None:
             log.warning("mpv already started (pid=%s)", self._proc.pid)
             return
@@ -114,7 +94,7 @@ class MpvPlayer:
                     self._sock.setblocking(False)
                     self._sock.connect(str(self.socket_path))
                     self._connected.set()
-                    # Start background reader to surface "end-file" events.
+                    # Start SINGLE background reader
                     self._reader_task = asyncio.create_task(self._read_loop(), name="mpv-reader")
                     log.info("mpv IPC connected at %s", self.socket_path)
                     return
@@ -131,7 +111,7 @@ class MpvPlayer:
             await asyncio.sleep(0.05)
 
     async def _read_loop(self) -> None:
-        """Read unsolicited events from mpv and surface 'end-file'."""
+        """Single reader: dispatch command responses and events."""
         assert self._sock is not None
         loop = asyncio.get_event_loop()
         buf = b""
@@ -152,13 +132,29 @@ class MpvPlayer:
                         msg = json.loads(line.decode("utf-8", errors="replace"))
                     except json.JSONDecodeError:
                         continue
-                    if msg.get("event") == "end-file":
-                        log.debug("mpv end-file: %s", msg)
-                        self._end_file_event.set()
-        except Exception as e:  # pragma: no cover — defensive
+
+                    # Route: command response vs event
+                    if "request_id" in msg and msg["request_id"] is not None:
+                        req_id = msg["request_id"]
+                        fut = self._pending_responses.pop(req_id, None)
+                        if fut and not fut.done():
+                            fut.set_result(msg)
+                    elif "event" in msg:
+                        self._handle_event(msg)
+        except Exception as e:
             log.warning("mpv read loop terminated: %s", e)
         finally:
             log.debug("mpv read loop exited")
+
+    def _handle_event(self, msg: dict) -> None:
+        """Route mpv events to the right handler."""
+        event = msg.get("event")
+        if event == "end-file":
+            log.info("mpv end-file: reason=%s", msg.get("reason"))
+            self._end_file_event.set()
+        elif event in ("start-file", "file-loaded", "playback-restart"):
+            log.debug("mpv event: %s", event)
+        # Ignore other events (audio-reconfig, idle, etc.)
 
     async def wait_ready(self, timeout_sec: float = 5.0) -> None:
         await asyncio.wait_for(self._connected.wait(), timeout=timeout_sec)
@@ -188,7 +184,7 @@ class MpvPlayer:
             except OSError:
                 pass
             self._sock = None
-        # Pitfall #1 from the master skill: clean up the socket file.
+        # Clean up the socket file.
         try:
             if self.socket_path.exists():
                 self.socket_path.unlink()
@@ -199,24 +195,34 @@ class MpvPlayer:
 
     # ----------------------------------------------------------- IPC helpers
     async def _send_command(self, command: list[Any]) -> Optional[dict]:
-        """Send a JSON command to mpv and return the response (if any)."""
+        """Send a JSON command to mpv and wait for its response.
+
+        Uses request_id so the single reader can route the response back.
+        """
         if self._sock is None:
             raise RuntimeError("mpv not connected")
-        async with self._write_lock:
-            payload = (json.dumps({"command": command}) + "\n").encode("utf-8")
+
+        self._request_counter += 1
+        req_id = self._request_counter
+        payload = (json.dumps({"command": command, "request_id": req_id}) + "\n").encode("utf-8")
+
+        # Create a future for the response
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending_responses[req_id] = fut
+
+        try:
             loop = asyncio.get_event_loop()
             await loop.sock_sendall(self._sock, payload)
-            # Some commands (e.g. loadfile) don't reply with a synchronous
-            # response. We do a short read with a small timeout — most
-            # commands return within tens of milliseconds.
-            try:
-                data = await asyncio.wait_for(loop.sock_recv(self._sock, 8192), timeout=0.1)
-                line = data.split(b"\n", 1)[0]
-                return json.loads(line.decode("utf-8", errors="replace"))
-            except asyncio.TimeoutError:
-                return None
-            except (ConnectionError, json.JSONDecodeError):
-                return None
+            # Wait for the response with a timeout
+            return await asyncio.wait_for(fut, timeout=2.0)
+        except asyncio.TimeoutError:
+            log.debug("command timed out: %s", command)
+            self._pending_responses.pop(req_id, None)
+            return None
+        except (ConnectionError, OSError) as e:
+            log.debug("command failed: %s", e)
+            self._pending_responses.pop(req_id, None)
+            return None
 
     # ----------------------------------------------------------- public API
     async def loadfile(self, path: str) -> None:

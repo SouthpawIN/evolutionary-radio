@@ -3,22 +3,17 @@
 
 brain:
   # OmniStep 6B — text LLM, OpenAI-format API (llama-server /v1/chat/completions)
-  url: http://localhost:11450
+  url: http://localhost:PORT
   model: omnisenter-6b
   timeout_sec: 30
   # How to render a "vibe" string into a fully-formed ACE-Step tag string
   # (the prompt template is in prompt_template.py)
   system_prompt: |
-    You are the brain of an infinite generative music radio. The user gives you
-    a vibe (a short mood description). Your job is to produce a single
-    ACE-Step tag string (a comma-separated list of style/mood tags such as
-    "lofi, chill, 80bpm, warm pads, dusty drums, vinyl hiss") that will be
-    fed to the ACE-Step v1.5 voice synthesizer. Keep it under 200 characters.
-    Output ONLY the tag string, no commentary.
+    [REDACTED_SYSTEM_PROMPT]
 
 voice:
   # ACE-Step v1.5 SFT 2B — DiT decoder, audio synthesis
-  url: http://localhost:7860
+  url: http://localhost:PORT
   default_model: ace-step-v1.5-sft-2b
   # ACE-Step typical params (see acestep_client.py)
   duration_sec: 60
@@ -75,7 +70,7 @@ state:
   refresh_sec: 2
 
 log:
-  file: ~/projects/AI-ML/evolutionary-radio/radio.log
+  file: ~/path/to/radio.log
   level: INFO
 
-skip_log: ~/music/skip_log.jsonl
+skip_log: ~/path/to/skip_log.jsonl
