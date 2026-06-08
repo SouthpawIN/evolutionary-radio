@@ -249,3 +249,14 @@ evolutionary-radio/
 
 Chris (SouthpawIN) — Senter Dev Discord, Nous Research
 See also: [`evolutionary-model-merging`](../evolutionary-model-merging), [`multimodal-expansion`](../multimodal-expansion)
+
+---
+
+## Related: the OmniSenter system
+
+Evolutionary Radio is one application of the OmniSenter architecture. The broader system:
+- **OmniSenter-MoE-32A8B** — the main 5-stage pipeline. Synthesia adds cross-modal memory; Ohm adds self-evolution
+- **Design post**: [OmniSenter: The Self-Evolving Multimodal Auxiliary for Hermes](https://github.com/SouthpawIN/evolutionary-training/blob/master/blog/omnisenter-self-evolving.md)
+- **Architecture wiki**: `~/wiki/concepts/omnisenter-architecture.md`
+- **Synthesia wiki** (cross-modal memory): `~/wiki/concepts/synthesia.md`
+- **Ohm wiki** (self-evolving model): `~/wiki/concepts/omnisenter-ohm.md`
