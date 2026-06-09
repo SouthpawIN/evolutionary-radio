@@ -35,10 +35,42 @@ from mpv_player import MpvPlayer
 from prompt_template import PromptTemplate
 from omni_client import OmniClient
 from acestep_client import AceStepClient
-from skip_logger import SkipLogger
-from feedback import FeedbackLogger, FeedbackRecord
-from gepa import GEPAPool
-from darwin import DarwinPopulation
+# Stripped-down radio (2026-06-09): Darwin/GEPA moved to code/advanced/.
+# They're still available but OFF BY DEFAULT. To re-enable:
+#   - Pass --enable-darwin / --enable-gepa on the CLI
+#   - Or set the env vars RADIO_ENABLE_DARWIN=1 / RADIO_ENABLE_GEPA=1
+# The default radio is just: play, generate, polite-chat. Simple.
+try:
+    from skip_logger import SkipLogger
+except ImportError:
+    SkipLogger = None
+try:
+    from feedback import FeedbackLogger, FeedbackRecord
+except ImportError:
+    FeedbackLogger = None
+    FeedbackRecord = None
+try:
+    from gepa import GEPAPool
+except ImportError:
+    GEPAPool = None
+try:
+    from darwin import DarwinPopulation
+except ImportError:
+    DarwinPopulation = None
+# Lazy import for the advanced path (relative path)
+def _import_advanced(name):
+    """Lazy-import from code/advanced/ when explicitly enabled."""
+    import importlib.util
+    p = Path(__file__).resolve().parent / "advanced" / f"{name}.py"
+    if not p.exists():
+        return None
+    spec = importlib.util.spec_from_file_location(f"radio.advanced.{name}", p)
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
 
 # ---------------------------------------------------------------------------
 # Config
@@ -313,12 +345,27 @@ async def run_radio(vibe: str, cfg: dict) -> None:
 
     voice = AceStepClient()
 
-    skip_logger = SkipLogger(path=cfg.get("skip_log", os.path.expanduser("~/path/to/skip_log.jsonl")))
+    # Feedback + evolution systems (advanced — only loaded if enabled)
+    if SkipLogger is not None and FeedbackLogger is not None:
+        skip_logger = SkipLogger(path=cfg.get("skip_log", os.path.expanduser("~/path/to/skip_log.jsonl")))
+        feedback_logger = FeedbackLogger()
+    else:
+        skip_logger = None
+        feedback_logger = None
 
-    # Feedback + evolution systems
-    feedback_logger = FeedbackLogger()
-    gepa_pool = GEPAPool(feedback_logger)
-    darwin_pop = DarwinPopulation(feedback_logger)
+    # Advanced: Darwin/GEPA only loaded if explicitly enabled
+    gepa_pool = None
+    darwin_pop = None
+    if os.environ.get("RADIO_ENABLE_DARWIN") == "1":
+        mod = _import_advanced("darwin")
+        if mod and feedback_logger:
+            darwin_pop = mod.DarwinPopulation(feedback_logger)
+            log.info("Darwin weight evolution: ENABLED")
+    if os.environ.get("RADIO_ENABLE_GEPA") == "1":
+        mod = _import_advanced("gepa")
+        if mod and feedback_logger:
+            gepa_pool = mod.GEPAPool(feedback_logger)
+            log.info("GEPA prompt evolution: ENABLED")
 
     # Write PID file
     _write_pid()
@@ -492,7 +539,11 @@ def cmd_queue(_args):
         print("  (empty)")
 
 def cmd_evolve(_args):
-    """Trigger an immediate evolution step."""
+    """Trigger an immediate evolution step (advanced — requires RADIO_ENABLE_GEPA + RADIO_ENABLE_DARWIN)."""
+    if GEPAPool is None or DarwinPopulation is None or FeedbackLogger is None:
+        print("Evolution is disabled in the stripped-down radio.")
+        print("Re-enable with: RADIO_ENABLE_GEPA=1 RADIO_ENABLE_DARWIN=1 ./start_radio.sh start")
+        return
     feedback = FeedbackLogger()
     gepa_pool = GEPAPool(feedback)
     darwin_pop = DarwinPopulation(feedback)
