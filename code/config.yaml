@@ -1,0 +1,77 @@
+# Evolutionary Radio — v0.2.0 configuration
+# All paths can be absolute or start with ~. Ports follow OmniSenter convention.
+
+brain:
+  # OmniStep — text LLM, OpenAI-format API
+  # Uses turbofit aux endpoint when available, falls back to ACE-Step's text encoder
+  url: http://127.0.0.1:8082
+  model: omnisenter-6b
+  timeout_sec: 30
+  # How to render a "vibe" string into a fully-formed ACE-Step tag string
+  # (the prompt template is in prompt_template.py)
+  system_prompt: |
+    [REDACTED_SYSTEM_PROMPT]
+
+voice:
+  # ACE-Step v1.5 SFT 2B — DiT decoder, audio synthesis
+  url: http://127.0.0.1:8001
+  default_model: ace-step-v1.5-sft-2b
+  # ACE-Step typical params (see acestep_client.py)
+  duration_sec: 60
+  # Generations are slow; allow generous timeouts
+  poll_interval_sec: 2
+  timeout_sec: 600
+  # If voice is not up, the queue fill loop will retry every `retry_sec`
+  retry_sec: 10
+
+queue:
+  # asyncio.Queue — bounded so we never burst past the player's needs
+  maxsize: 5
+  # Sleep between fill checks (seconds)
+  fill_sleep_sec: 5
+  # Skip-rate threshold below which the queue fill is considered "healthy"
+  target_depth: 3
+
+player:
+  # mpv IPC socket — created on start, unlinked on stop
+  socket_dir: /tmp
+  # Initial volume (0-100)
+  volume: 70
+  # mpv binary
+  binary: mpv
+  # Default mpv args (audio-only, no terminal, quiet)
+  extra_args:
+    - "--no-video"
+    - "--no-terminal"
+    - "--quiet"
+    - "--audio-display=no"
+    - "--idle=yes"
+
+gepa:
+  # GEPA: Gradient-Free Prompt Evolution
+  population_size: 8
+  mutation_rate: 0.3
+  tournament_size: 3
+
+darwin:
+  # Darwin Family: Genome evolution via MRI-Trust Fusion
+  population_size: 8
+  tournament_size: 3
+
+evolution:
+  # How often to run GEPA + Darwin evolution (seconds)
+  interval_sec: 600
+
+state:
+  # Where the running radio writes its current state (queue depth, last tracks, etc.)
+  # CLI commands (`status`, `skip`) read from here.
+  file: ~/.local/share/evolutionary-radio/state.json
+  pid_file: ~/.local/share/evolutionary-radio/radio.pid
+  # How often the running radio refreshes the state file
+  refresh_sec: 2
+
+log:
+  file: ~/music/radio.log
+  level: INFO
+
+skip_log: ~/.local/share/evolutionary-radio/skip_log.jsonl
